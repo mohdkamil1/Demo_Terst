@@ -1,0 +1,125 @@
+name: Code Quality (SonarQube)
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Only keep the newest run per branch/PR; cancel stale ones.
+concurrency:
+  group: sonar-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write   # needed for SonarQube PR decoration / comments
+
+env:
+  SKIP_THRESHOLD: 5              # how many skips are allowed before a scan is forced
+  TRACKER_VAR: SONAR_SKIP_TRACKER
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) Decide whether this push/PR should be scanned or is allowed to skip.
+  #    Maintains a per-user skip counter stored in a repository variable.
+  # ---------------------------------------------------------------------------
+  evaluate-skip:
+    runs-on: ubuntu-latest
+    outputs:
+      should_scan: ${{ steps.decide.outputs.should_scan }}
+      notify: ${{ steps.decide.outputs.notify }}
+      enforced: ${{ steps.decide.outputs.enforced }}
+      skip_count: ${{ steps.decide.outputs.skip_count }}
+      recipients: ${{ steps.decide.outputs.recipients }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Decide skip vs scan
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.SONAR_SKIP_PAT }}          # PAT with Variables read/write
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message || github.event.pull_request.title }}
+          PUSHER_EMAIL: ${{ github.event.head_commit.author.email }}
+          ADMIN_EMAIL: ${{ vars.SONAR_ADMIN_EMAIL }}
+          THRESHOLD: ${{ env.SKIP_THRESHOLD }}
+          VAR_NAME: ${{ env.TRACKER_VAR }}
+        run: bash .github/scripts/sonar-skip-tracker.sh
+
+      - name: Email admin + pusher when skip limit is reached
+        if: steps.decide.outputs.notify == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          secure: true
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          from: SonarQube CI <${{ secrets.SMTP_USERNAME }}>
+          to: ${{ steps.decide.outputs.recipients }}
+          subject: "[SonarQube] Skip limit reached by ${{ github.actor }} in ${{ github.repository }}"
+          body: |
+            Hi ${{ github.actor }},
+
+            You have now skipped the SonarQube analysis ${{ steps.decide.outputs.skip_count }} time(s)
+            on ${{ github.repository }} (limit: ${{ env.SKIP_THRESHOLD }}).
+
+            Policy: after ${{ env.SKIP_THRESHOLD }} skipped scans you must run a full SonarQube
+            analysis. From now on the [skip sonar] flag is ignored for your pushes and the scan
+            runs automatically until the Quality Gate passes, which resets your counter.
+
+            Enforced on this push: ${{ steps.decide.outputs.enforced }}
+            Commit:  ${{ github.sha }}
+            Ref:     ${{ github.ref_name }}
+            Actor:   ${{ github.actor }}
+
+            — Automated Code Quality Bot
+
+  # ---------------------------------------------------------------------------
+  # 2) Run the actual SonarQube scan + Quality Gate (only when not skipped).
+  # ---------------------------------------------------------------------------
+  sonarqube:
+    needs: evaluate-skip
+    if: needs.evaluate-skip.outputs.should_scan == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # needed for accurate "new code" / blame detection
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}   # https://sonarcloud.io for SonarQube Cloud
+
+      - name: Quality Gate check
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  # ---------------------------------------------------------------------------
+  # 3) On a successful scan, reset that user's skip counter to zero.
+  # ---------------------------------------------------------------------------
+  reset-counter:
+    needs: sonarqube
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reset skip counter for actor
+        env:
+          GH_TOKEN: ${{ secrets.SONAR_SKIP_PAT }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          VAR_NAME: ${{ env.TRACKER_VAR }}
+          RESET: "true"
+        run: bash .github/scripts/sonar-skip-tracker.sh
